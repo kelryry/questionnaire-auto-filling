@@ -1,4 +1,4 @@
-##🤖 多平台问卷AI自动填写 (Multi-Platform Questionnaire AI Auto-Filler)
+## 🤖 多平台问卷AI自动填写 (Multi-Platform Questionnaire AI Auto-Filler)
 
 > **拒绝随机乱填，让 AI 帮你像真人一样回答问题。**
 > **Stop filling randomly. Let AI answer like a human.**
