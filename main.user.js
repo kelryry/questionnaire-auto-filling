@@ -3,6 +3,8 @@
 // @name:zh-CN   多平台问卷AI自动填写
 // @namespace    https://github.com/kelryry
 // @version      2.1
+// @license      GPL-3.0-only
+// @author       kelryry
 // @description  Extracts DOM structure with heuristic question-group detection, sends it to an AI LLM for semantic analysis, and simulates human input to fill forms. Supports OpenAI-compatible APIs, Google Gemini, and Anthropic Claude. Features: token truncation detection, click verification, multi-round pagination with DOM change tracking, and a "skip" action for uncertain questions. Dual-strategy networking (fetch + GM_xmlhttpRequest fallback) for proxy and CORS compatibility.
 // @description:zh-CN 提取页面DOM结构并进行启发式题目分组，发送给AI大模型进行语义分析，模拟人类输入填表。支持OpenAI兼容API、Google Gemini和Anthropic Claude。特性：token截断检测、点击验证、多轮分页DOM变化追踪、不确定题目跳过。双策略网络请求兼容代理与跨域环境。
 // @author       AI-Assistant
