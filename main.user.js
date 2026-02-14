@@ -121,7 +121,13 @@
             Agree to Terms: Yes/Agree
         `,
 
-        // 11. Debug Mode / 调试模式
+        // 11. Multi-Round / Pagination / 多轮填写与分页
+        //     maxRounds: Maximum number of rounds to scan and fill.
+        //               Useful for multi-page forms or forms with conditional logic.
+        //               设置最大扫描填写轮数，适用于多页问卷或有条件逻辑的问卷。
+        maxRounds: 2,
+
+        // 12. Debug Mode / 调试模式
         //     If true, prints the HTML payload and AI plan to the console.
         debug: true
     };
@@ -221,9 +227,12 @@
         if (!element) return;
         try {
             element.scrollIntoView({ behavior: 'auto', block: 'center' });
-            element.click();
+            // Correct user interaction order: pointer/mouse down → up → click
+            element.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
             element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+            element.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
             element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+            element.click();
         } catch (e) {
             console.error("Click failed", e);
         }
@@ -236,9 +245,41 @@
 
     function isInteractive(el) {
         const tag = el.tagName.toLowerCase();
-        if (['input', 'textarea', 'select', 'button'].includes(tag)) return true;
-        const style = window.getComputedStyle(el);
-        return style.cursor === 'pointer';
+        if (['input', 'textarea', 'select', 'button', 'option'].includes(tag)) return true;
+        // Semantic role-based detection instead of cursor:pointer to reduce noise
+        const role = el.getAttribute('role');
+        if (role && ['button', 'option', 'radio', 'checkbox', 'menuitem',
+            'menuitemradio', 'menuitemcheckbox', 'tab', 'switch', 'combobox',
+            'listbox', 'slider', 'spinbutton'].includes(role)) return true;
+        // Also check for elements with click handlers via common data attributes
+        if (el.getAttribute('data-value') !== null ||
+            el.getAttribute('data-index') !== null) return true;
+        return false;
+    }
+
+    /**
+     * Find the best root element for form extraction.
+     * Tries platform-specific containers first, then <form>, then body.
+     */
+    function findFormRoot() {
+        // Platform-specific selectors (ordered by specificity)
+        const platformSelectors = [
+            // 问卷星 (wjx.cn / wjx.top)
+            '#divQuestion', '.fieldset_container', '#contentDiv',
+            // 腾讯问卷 (docs.qq.com/form)
+            '.question-list', '.survey-body', '.render-content',
+            // Generic form fallback
+            'form[action]', 'form'
+        ];
+        for (const sel of platformSelectors) {
+            const el = document.querySelector(sel);
+            if (el && el.querySelector('input, textarea, select, [role="radio"], [role="checkbox"]')) {
+                if (CONFIG.debug) console.log(`[AI Auto-Filler] Form root: ${sel}`);
+                return el;
+            }
+        }
+        if (CONFIG.debug) console.log('[AI Auto-Filler] Form root: document.body (fallback)');
+        return document.body;
     }
 
     function generateSimplifiedDOM(root) {
@@ -248,12 +289,12 @@
 
         function traverse(node, depth) {
             if (!node || node.nodeType !== 1 ||
-                node.offsetWidth <= 0 && node.offsetHeight <= 0 && node.tagName !== 'OPTION') {
+                (node.offsetWidth <= 0 && node.offsetHeight <= 0 && node.tagName !== 'OPTION')) {
                 return;
             }
 
             const tag = node.tagName.toLowerCase();
-            if (['script', 'style', 'svg', 'path', 'noscript', 'meta', 'link'].includes(tag)) return;
+            if (['script', 'style', 'svg', 'path', 'noscript', 'meta', 'link', 'img', 'iframe'].includes(tag)) return;
 
             let directText = "";
             node.childNodes.forEach(child => {
@@ -264,6 +305,13 @@
             const placeholder = node.getAttribute('placeholder');
             const ariaLabel = node.getAttribute('aria-label');
             const type = node.getAttribute('type');
+            const name = node.getAttribute('name');
+            const forAttr = node.getAttribute('for');
+            const role = node.getAttribute('role');
+            const isRequired = node.hasAttribute('required') ||
+                node.getAttribute('aria-required') === 'true' ||
+                node.hasAttribute('data-required');
+            const isDisabled = node.hasAttribute('disabled');
 
             const interactive = isInteractive(node);
 
@@ -276,14 +324,30 @@
 
                 if (interactive) line += ` _ai_id="${myId}"`;
                 if (type) line += ` type="${type}"`;
+                if (name) line += ` name="${name}"`;
                 if (placeholder) line += ` placeholder="${placeholder}"`;
                 if (ariaLabel) line += ` label="${ariaLabel}"`;
+                if (forAttr) line += ` for="${forAttr}"`;
+                if (role) line += ` role="${role}"`;
+                if (isRequired) line += ` required`;
+                if (isDisabled) line += ` disabled`;
 
                 line += ">";
                 if (directText) line += ` ${directText}`;
 
+                // Show current value / state for interactive elements
                 if (tag === 'input' && (type === 'radio' || type === 'checkbox')) {
                     line += node.checked ? " [CHECKED]" : "";
+                } else if (tag === 'option') {
+                    if (node.selected) line += " [SELECTED]";
+                    const val = node.getAttribute('value');
+                    if (val !== null && val !== directText) line += ` value="${val}"`;
+                } else if ((tag === 'input' || tag === 'textarea') && node.value) {
+                    line += ` [current="${node.value}"]`;
+                } else if (tag === 'select' && node.value) {
+                    const selectedOption = node.options?.[node.selectedIndex];
+                    const selectedText = selectedOption?.textContent?.trim() || node.value;
+                    line += ` [current="${selectedText}"]`;
                 }
 
                 output.push(line);
@@ -349,9 +413,10 @@
 
     /**
      * Build the API request (url + fetch options) for the configured provider.
+     * Accepts { systemPrompt, userPrompt } for proper role separation.
      * 根据配置的提供商构建 API 请求（URL + fetch 选项）。
      */
-    function buildApiRequest(prompt) {
+    function buildApiRequest({ systemPrompt, userPrompt }) {
         const provider = CONFIG.apiProvider;
         const model = getEffectiveModel();
         const baseUrl = getEffectiveUrl();
@@ -364,7 +429,8 @@
                 const body = {
                     model: model,
                     messages: [
-                        { role: "user", content: prompt }
+                        { role: "system", content: systemPrompt },
+                        { role: "user", content: userPrompt }
                     ],
                     response_format: { type: "json_object" },
                     ...CONFIG.customParams  // Merge user-defined extra params (e.g. temperature, reasoning_effort)
@@ -397,7 +463,8 @@
                     generationConfig.thinkingConfig = { thinkingBudget: CONFIG.thinkingBudget };
                 }
                 const body = {
-                    contents: [{ parts: [{ text: prompt }] }],
+                    systemInstruction: { parts: [{ text: systemPrompt }] },
+                    contents: [{ parts: [{ text: userPrompt }] }],
                     generationConfig: generationConfig
                 };
                 return {
@@ -417,8 +484,9 @@
                 const body = {
                     model: model,
                     max_tokens: 4096,
+                    system: systemPrompt,
                     messages: [
-                        { role: "user", content: prompt }
+                        { role: "user", content: userPrompt }
                     ]
                 };
                 // Thinking chain support for Anthropic (extended thinking)
@@ -518,6 +586,108 @@
     }
 
     // =========================================================================
+    // [JSON EXTRACTION & VALIDATION]
+    // =========================================================================
+
+    /**
+     * Extract JSON from LLM response text, tolerating markdown fences and extra text.
+     */
+    function extractJSON(text) {
+        if (!text || typeof text !== 'string') throw new Error('Empty response from AI');
+        text = text.trim();
+
+        // 1. Try direct parse
+        try { return JSON.parse(text); } catch (_) { /* continue */ }
+
+        // 2. Try extracting from ```json ... ``` or ``` ... ``` fences
+        const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+        if (fenceMatch) {
+            try { return JSON.parse(fenceMatch[1].trim()); } catch (_) { /* continue */ }
+        }
+
+        // 3. Try finding first [ ... ] or { ... } block
+        const bracketMatch = text.match(/(\[\s*\{[\s\S]*\}\s*\])/);
+        if (bracketMatch) {
+            try { return JSON.parse(bracketMatch[1]); } catch (_) { /* continue */ }
+        }
+        const objectMatch = text.match(/(\{[\s\S]*\})/);
+        if (objectMatch) {
+            try {
+                const parsed = JSON.parse(objectMatch[1]);
+                return Array.isArray(parsed) ? parsed : [parsed];
+            } catch (_) { /* continue */ }
+        }
+
+        throw new Error(`Failed to extract JSON from AI response. Raw text: ${text.substring(0, 300)}`);
+    }
+
+    /**
+     * Validate and filter the AI plan, keeping only valid steps.
+     */
+    function validatePlan(plan) {
+        if (!Array.isArray(plan)) {
+            if (plan && typeof plan === 'object') plan = [plan];
+            else throw new Error('AI plan is not an array or object');
+        }
+
+        const valid = [];
+        for (let i = 0; i < plan.length; i++) {
+            const step = plan[i];
+            if (!step || typeof step !== 'object') {
+                console.warn(`[AI Auto-Filler] Skipping invalid step ${i}: not an object`);
+                continue;
+            }
+            if (typeof step.id !== 'string' || !step.id.startsWith('el_')) {
+                console.warn(`[AI Auto-Filler] Skipping step ${i}: invalid id "${step.id}"`);
+                continue;
+            }
+            if (step.action !== 'fill' && step.action !== 'click') {
+                console.warn(`[AI Auto-Filler] Skipping step ${i}: invalid action "${step.action}"`);
+                continue;
+            }
+            if (step.action === 'fill' && (step.value === undefined || step.value === null)) {
+                console.warn(`[AI Auto-Filler] Skipping step ${i} (${step.id}): fill action missing value`);
+                continue;
+            }
+            valid.push(step);
+        }
+
+        if (valid.length === 0 && plan.length > 0) {
+            console.error('[AI Auto-Filler] All steps were invalid! Original plan:', plan);
+        }
+
+        return valid;
+    }
+
+    /**
+     * Wait for DOM to stabilize (no mutations for a period).
+     * Used after page navigation or conditional logic triggers.
+     */
+    function waitForDOMStable(stableMs = 500, timeoutMs = 5000) {
+        return new Promise(resolve => {
+            let timer = null;
+            const observer = new MutationObserver(() => {
+                clearTimeout(timer);
+                timer = setTimeout(() => {
+                    observer.disconnect();
+                    resolve(true);
+                }, stableMs);
+            });
+            observer.observe(document.body, { childList: true, subtree: true, attributes: true });
+            // Initial timer in case DOM is already stable
+            timer = setTimeout(() => {
+                observer.disconnect();
+                resolve(true);
+            }, stableMs);
+            // Hard timeout
+            setTimeout(() => {
+                observer.disconnect();
+                resolve(false);
+            }, timeoutMs);
+        });
+    }
+
+    // =========================================================================
     // [AI AGENT LOGIC]
     // =========================================================================
 
@@ -525,39 +695,75 @@
         const providerName = getProviderName();
         updateStatus("Scanning Page...", "yellow");
 
-        // 1. Snapshot DOM
-        const simplifiedHTML = generateSimplifiedDOM(document.body);
+        // 1. Snapshot DOM from the best form root
+        const formRoot = findFormRoot();
+        const simplifiedHTML = generateSimplifiedDOM(formRoot);
 
         if (CONFIG.debug) {
             console.log("--- Payload Sent to AI ---");
             console.log(simplifiedHTML);
         }
 
-        // 2. Construct System Prompt
-        const prompt = `
-        You are an auto-filling agent.
-        Your goal: Fill the form based on User Profile.
+        // 2. Construct System + User Prompts (separated for proper role handling)
+        const systemPrompt = `You are a form auto-filling agent. You analyze simplified HTML structure and output a JSON action plan to fill in a questionnaire/form.
 
-        User Profile:
-        ${CONFIG.userProfile}
+## Action Types
+- "fill": Set the value of <input>, <textarea>, or <select> elements.
+- "click": Click on radio buttons, checkboxes, clickable option elements, or buttons.
 
-        Simplified HTML Structure:
-        ${simplifiedHTML}
+## Rules
+1. Match labels/questions to their associated inputs by DOM hierarchy (indentation = parent-child) and \`for\`/\`name\` attributes.
+2. Use the User Profile to answer personal information questions (name, phone, email, address, etc.).
+3. For opinion/attitude questions (Likert scales, satisfaction ratings, agreement scales):
+   - Select a slightly positive option (e.g., "比较满意", "agree", 4 out of 5).
+   - Never select extreme endpoints unless the profile explicitly indicates it.
+4. For knowledge/preference questions not covered by the profile, choose the most common or neutral answer.
+5. For terms/agreements/consent questions, always agree/accept.
+6. For matrix/grid questions, fill each row as a separate action.
+7. For <select> dropdowns: use "fill" with the option text or value.
+8. For radio/checkbox groups: use "click" on the element whose text matches your chosen option.
+9. Skip elements marked [disabled]. Respect elements marked [required] — always fill them.
+10. Do NOT click submit/next-page buttons — they will be handled separately.
+11. If an element already has a [current=...] value that looks correct, you may skip it.
 
-        Instructions:
-        1. Analyze the structure to link Labels with Inputs (based on indentation/hierarchy).
-        2. Output a JSON plan.
-        3. Use "fill" for inputs/textareas/selects.
-        4. Use "click" for radio options, checkboxes, and buttons.
-        5. IMPORTANT: For "fill", output the string value.
-        6. IMPORTANT: For "click", choose the element that looks like the option text (e.g. the div containing "Male").
-        
-        Response JSON Schema (Array of objects):
-        [
-          {"id": "el_xxx", "action": "fill", "value": "my value"},
-          {"id": "el_yyy", "action": "click", "reason": "Select Gender"}
-        ]
-        `;
+## Output Format
+Respond with ONLY a JSON array. No explanation, no markdown fences. Each object:
+{"id": "<_ai_id>", "action": "fill"|"click", "value": "<string, only for fill>"}
+
+## Examples
+Input with name field:
+  <input _ai_id="el_0" type="text" name="username" placeholder="请输入姓名" required>
+→ {"id": "el_0", "action": "fill", "value": "John Doe"}
+
+Radio group for gender:
+  <label> 性别
+    <div _ai_id="el_5" role="radio"> 男
+    <div _ai_id="el_6" role="radio"> 女
+→ {"id": "el_5", "action": "click"}
+
+Select dropdown:
+  <select _ai_id="el_10" name="education" required>
+    <option _ai_id="el_11"> 高中
+    <option _ai_id="el_12"> 本科 [SELECTED]
+    <option _ai_id="el_13"> 硕士
+→ (already correct, skip or): {"id": "el_10", "action": "fill", "value": "本科"}
+
+Likert scale (1-5 satisfaction):
+  <label> 您对服务的满意度
+    <div _ai_id="el_20"> 非常不满意
+    <div _ai_id="el_21"> 不满意
+    <div _ai_id="el_22"> 一般
+    <div _ai_id="el_23"> 满意
+    <div _ai_id="el_24"> 非常满意
+→ {"id": "el_23", "action": "click"}`;
+
+        const userPrompt = `User Profile:
+${CONFIG.userProfile}
+
+Simplified HTML Structure:
+${simplifiedHTML}
+
+Based on the user profile and the form structure above, output your JSON action plan.`;
 
         updateStatus(`${providerName} Thinking...`, "#00ffff");
 
@@ -572,7 +778,7 @@
                     await new Promise(r => setTimeout(r, CONFIG.retryDelayMs));
                 }
 
-                const { url, options } = buildApiRequest(prompt);
+                const { url, options } = buildApiRequest({ systemPrompt, userPrompt });
 
                 if (CONFIG.debug) {
                     console.log(`--- API Request (attempt ${attempt}/${maxAttempts}) ---`);
@@ -603,11 +809,10 @@
                 }
 
                 const planText = parseApiResponse(data);
-                const plan = JSON.parse(planText);
+                const plan = validatePlan(extractJSON(planText));
 
                 console.log(`${providerName} Plan:`, plan);
-                await executePlan(plan);
-                return; // Success, exit loop
+                return await executePlan(plan); // Return result for multi-round
 
             } catch (e) {
                 lastError = e;
@@ -621,37 +826,69 @@
 
         // All attempts failed
         updateStatus(`Error: ${lastError.message}`, "red");
+        return { filled: 0, clicked: 0, skipped: 0, submitBtn: null };
     }
 
     async function executePlan(plan) {
         updateStatus(`Executing ${plan.length} actions...`, "#00ff00");
 
         let submitBtn = null;
+        let nextPageBtn = null;
+        let filled = 0, clicked = 0, skipped = 0, fillFailed = 0;
+        const submitKeywords = ['提交', 'submit', '下一步', '完成', '结束', 'next', '下一页'];
 
         for (const step of plan) {
             const el = elementMap.get(step.id);
-            if (!el) continue;
+            if (!el) {
+                skipped++;
+                if (CONFIG.debug) console.warn(`[AI Auto-Filler] Element not found: ${step.id}`);
+                continue;
+            }
 
             const text = (el.innerText || el.value || "").toLowerCase();
-            if (step.action === 'click' && (text.includes('提交') || text.includes('submit') || text.includes('下一步'))) {
-                submitBtn = el;
+
+            // Detect submit buttons
+            if (step.action === 'click' && submitKeywords.some(kw => text.includes(kw))) {
+                // Distinguish next-page vs final submit
+                if (text.includes('下一步') || text.includes('next') || text.includes('下一页')) {
+                    nextPageBtn = el;
+                } else {
+                    submitBtn = el;
+                }
                 continue;
             }
 
             if (step.action === 'fill') {
                 simulateInput(el, step.value);
+                // Verify the fill took effect
+                if (el.value !== String(step.value)) {
+                    fillFailed++;
+                    if (CONFIG.debug) console.warn(`[AI Auto-Filler] Fill verification failed for ${step.id}: expected "${step.value}", got "${el.value}"`);
+                }
+                filled++;
             } else if (step.action === 'click') {
                 simulateClick(el);
+                clicked++;
             }
 
-            await new Promise(r => setTimeout(r, 20));
+            await new Promise(r => setTimeout(r, 50));
         }
 
-        finalize(submitBtn);
+        const statsMsg = `Done: ${filled} filled, ${clicked} clicked, ${skipped} skipped` +
+            (fillFailed > 0 ? `, ${fillFailed} fill-verify-failed` : '');
+        console.log(`[AI Auto-Filler] ${statsMsg}`);
+        updateStatus(statsMsg, skipped > 0 || fillFailed > 0 ? 'orange' : '#00ff00');
+
+        return { filled, clicked, skipped, submitBtn, nextPageBtn };
     }
 
     function finalize(submitBtn) {
-        const inputs = document.querySelectorAll('input[required], textarea[required]');
+        // Check for missing required fields (native + custom attributes)
+        const requiredSelectors = [
+            'input[required]', 'textarea[required]', 'select[required]',
+            '[aria-required="true"]', '[data-required]'
+        ];
+        const inputs = document.querySelectorAll(requiredSelectors.join(', '));
         let missing = false;
         inputs.forEach(el => {
             if (!el.value) {
@@ -684,6 +921,60 @@
     // [ENTRY POINT]
     // =========================================================================
 
+    /**
+     * Multi-round agent loop: runs runAgent, handles pagination and conditional logic.
+     * After each round, if a next-page button is found, clicks it and re-scans.
+     */
+    async function runMultiRound() {
+        const maxRounds = Math.max(1, CONFIG.maxRounds || 1);
+        let lastSubmitBtn = null;
+
+        for (let round = 1; round <= maxRounds; round++) {
+            if (round > 1) {
+                updateStatus(`Round ${round}/${maxRounds}: Scanning...`, "yellow");
+            }
+
+            const result = await runAgent();
+
+            if (result.submitBtn) lastSubmitBtn = result.submitBtn;
+
+            // If there's a next-page button, click it and continue to next round
+            if (result.nextPageBtn) {
+                updateStatus(`Navigating to next page...`, "#00ffff");
+                simulateClick(result.nextPageBtn);
+                // Wait for DOM to stabilize after page navigation
+                await waitForDOMStable(800, 5000);
+                continue;
+            }
+
+            // If this round produced actions but no next-page, check if DOM changed
+            // (conditional logic may have revealed new questions)
+            if (result.filled > 0 || result.clicked > 0) {
+                const domChanged = await waitForDOMStable(500, 2000);
+                // Quick re-scan: check if new interactive elements appeared
+                const newFormRoot = findFormRoot();
+                const newDOM = generateSimplifiedDOM(newFormRoot);
+                const hasNewInteractive = elementMap.size > 0;
+                // If DOM has changed significantly (new elements appeared), do another round
+                if (domChanged && round < maxRounds && hasNewInteractive) {
+                    // Check if there are unfilled required fields
+                    const requiredFields = newFormRoot.querySelectorAll(
+                        'input[required]:not([disabled]), textarea[required]:not([disabled]), select[required]:not([disabled]), [aria-required="true"]:not([disabled])');
+                    const hasUnfilled = Array.from(requiredFields).some(el => !el.value);
+                    if (hasUnfilled) {
+                        console.log(`[AI Auto-Filler] Round ${round}: Found unfilled required fields, continuing...`);
+                        continue;
+                    }
+                }
+            }
+
+            // No next page and no new fields, done
+            break;
+        }
+
+        finalize(lastSubmitBtn);
+    }
+
     function main() {
         initUI();
 
@@ -710,13 +1001,13 @@
                 const n = Date.now();
                 if (n >= target - CONFIG.preLoadOffset) {
                     clearInterval(timer);
-                    runAgent();
+                    runMultiRound();
                 } else {
                     statusDiv.innerText = `🤖 Wait: ${((target - CONFIG.preLoadOffset - n) / 1000).toFixed(1)}s`;
                 }
             }, 100);
         } else {
-            runAgent();
+            runMultiRound();
         }
     }
 
