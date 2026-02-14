@@ -216,8 +216,12 @@ customParams: { "temperature": 0.5 }
 
 开发维护不易，如果这个脚本帮到了您，哪怕只是帮您省下了 5 分钟的时间，也希望您：
 
-1. 在 GitHub 上点亮右上角的 **Star** ⭐
+开发维护不易，如果这个脚本帮到了您，哪怕只是帮您省下了 5 分钟的时间，也希望您：
+
+1. 在我的[GitHub项目页](https://github.com/kelryry/questionnaire-auto-filling) 上点亮右上角的 **Star** ⭐
 2. 推荐给你的朋友或同事
+
+你的支持是我持续更新的最大动力！💪
 
 你的支持是我持续更新的最大动力！💪
 
