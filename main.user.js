@@ -2,9 +2,9 @@
 // @name         Multi-Platform Questionnaire AI Auto-Filler
 // @name:zh-CN   多平台问卷AI自动填写
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  Extracts DOM structure, sends it to an AI LLM for semantic analysis, and simulates human input to fill forms. Supports OpenAI-compatible APIs, Google Gemini, and Anthropic Claude. Dual-strategy networking (fetch + GM_xmlhttpRequest fallback) for proxy and CORS compatibility. Custom user profiles. Works on modern frameworks (React/Vue).
-// @description:zh-CN 提取页面DOM结构，发送给AI大模型进行语义分析，并模拟人类输入进行填表。支持OpenAI兼容API、Google Gemini和Anthropic Claude。双策略网络请求（fetch + GM_xmlhttpRequest 回退）兼容代理与跨域环境。支持自定义用户画像，兼容现代前端框架（React/Vue）。
+// @version      2.1
+// @description  Extracts DOM structure with heuristic question-group detection, sends it to an AI LLM for semantic analysis, and simulates human input to fill forms. Supports OpenAI-compatible APIs, Google Gemini, and Anthropic Claude. Features: token truncation detection, click verification, multi-round pagination with DOM change tracking, and a "skip" action for uncertain questions. Dual-strategy networking (fetch + GM_xmlhttpRequest fallback) for proxy and CORS compatibility.
+// @description:zh-CN 提取页面DOM结构并进行启发式题目分组，发送给AI大模型进行语义分析，模拟人类输入填表。支持OpenAI兼容API、Google Gemini和Anthropic Claude。特性：token截断检测、点击验证、多轮分页DOM变化追踪、不确定题目跳过。双策略网络请求兼容代理与跨域环境。
 // @author       AI-Assistant
 // @match        https://example.com/replace-this-with-your-target-url/*
 // @match        https://docs.qq.com/form/*
@@ -240,7 +240,9 @@
 
     // =========================================================================
     // [DOM EXTRACTION]
-    // Converts HTML to a simplified format for the LLM to save tokens
+    // Converts HTML to a simplified format for the LLM to save tokens.
+    // After extraction, heuristic question-group markers ("--- Q ---") are
+    // inserted to help the AI identify question boundaries.
     // =========================================================================
 
     function isInteractive(el) {
@@ -357,7 +359,71 @@
         }
 
         traverse(root, 0);
-        return output.join("\n");
+        return injectQuestionGroupMarkers(output).join("\n");
+    }
+
+    /**
+     * Heuristic question group detection.
+     * Inserts "--- Q ---" markers between detected question groups.
+     * Best-effort & platform-agnostic: if no heuristics match, output is unchanged.
+     */
+    function injectQuestionGroupMarkers(lines) {
+        if (lines.length < 2) return lines;
+
+        const result = [];
+        let lastRadioName = null;
+        let hasInsertedAny = false;
+
+        // Patterns for question number/title prefixes (platform-agnostic)
+        const questionNumRe = /^(?:\d{1,3}[\.)、．）]\s*|Q\d{1,3}[\s.:：]|第.{1,4}[题问]\s*|[一二三四五六七八九十]{1,2}[、．.]\s*|\(\d{1,3}\)\s*|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮])/i;
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            const indent = (line.match(/^(\s*)/) || ['', ''])[1].length;
+            let shouldMark = false;
+
+            // Extract text content after the HTML ">"
+            const textAfterTag = line.match(/>\s*(.+)/);
+            const text = textAfterTag ? textAfterTag[1].replace(/\s*\[.*$/, '').trim() : '';
+
+            // Heuristic 1: Question number prefix at shallow depth
+            if (text && indent <= 4 && questionNumRe.test(text)) {
+                shouldMark = true;
+            }
+
+            // Heuristic 2: Semantic group markers (ARIA / HTML5)
+            if (/role="(?:group|radiogroup)"/.test(line) || /<fieldset\b/.test(line)) {
+                shouldMark = true;
+            }
+
+            // Heuristic 3: New radio/checkbox name group
+            const nameMatch = line.match(/name="([^"]+)"/);
+            const isCheckable = /type="(?:radio|checkbox)"/.test(line) ||
+                /role="(?:radio|checkbox)"/.test(line);
+            if (nameMatch && isCheckable) {
+                if (lastRadioName !== null && nameMatch[1] !== lastRadioName) {
+                    shouldMark = true;
+                }
+                lastRadioName = nameMatch[1];
+            } else if (!isCheckable && line.includes('_ai_id=')) {
+                // Non-checkable interactive element after a radio group → likely new question
+                if (lastRadioName !== null) {
+                    shouldMark = true;
+                    lastRadioName = null;
+                }
+            }
+
+            // Insert marker (avoid consecutive duplicates)
+            if (shouldMark && result.length > 0 && result[result.length - 1] !== '--- Q ---') {
+                result.push('--- Q ---');
+                hasInsertedAny = true;
+            }
+
+            result.push(line);
+        }
+
+        // Only return marked output if heuristics found at least one boundary
+        return hasInsertedAny ? result : lines;
     }
 
     // =========================================================================
@@ -522,6 +588,28 @@
     function parseApiResponse(data) {
         const provider = CONFIG.apiProvider;
 
+        // Detect token truncation
+        const truncationChecks = {
+            1: () => data.choices?.[0]?.finish_reason === 'length',
+            2: () => data.candidates?.[0]?.finishReason === 'MAX_TOKENS',
+            3: () => data.stop_reason === 'max_tokens'
+        };
+        if (truncationChecks[provider]?.()) {
+            console.warn('[AI Auto-Filler] ⚠️ Response truncated (token limit hit). Output may be incomplete.');
+        }
+
+        // Log token usage in debug mode
+        if (CONFIG.debug) {
+            try {
+                const usageStr = {
+                    1: () => data.usage && `Tokens: ${data.usage.prompt_tokens} in → ${data.usage.completion_tokens} out (${data.usage.total_tokens} total)`,
+                    2: () => data.usageMetadata && `Tokens: ${data.usageMetadata.promptTokenCount} in → ${data.usageMetadata.candidatesTokenCount} out (${data.usageMetadata.totalTokenCount} total)`,
+                    3: () => data.usage && `Tokens: ${data.usage.input_tokens} in → ${data.usage.output_tokens} out`
+                }[provider]?.();
+                if (usageStr) console.log(`[AI Auto-Filler] ${usageStr}`);
+            } catch (_) { /* ignore usage parsing errors */ }
+        }
+
         switch (provider) {
             case 1: {
                 // OpenAI-compatible: data.choices[0].message.content
@@ -596,26 +684,37 @@
         if (!text || typeof text !== 'string') throw new Error('Empty response from AI');
         text = text.trim();
 
+        // Unwrap common wrapper objects (e.g. {"actions": [...]})
+        function unwrap(parsed) {
+            if (Array.isArray(parsed)) return parsed;
+            if (parsed && typeof parsed === 'object') {
+                for (const key of ['actions', 'plan', 'steps', 'data', 'results']) {
+                    if (Array.isArray(parsed[key])) return parsed[key];
+                }
+                return [parsed];
+            }
+            return [parsed];
+        }
+
         // 1. Try direct parse
-        try { return JSON.parse(text); } catch (_) { /* continue */ }
+        try { return unwrap(JSON.parse(text)); } catch (_) { /* continue */ }
 
         // 2. Try extracting from ```json ... ``` or ``` ... ``` fences
         const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
         if (fenceMatch) {
-            try { return JSON.parse(fenceMatch[1].trim()); } catch (_) { /* continue */ }
+            try { return unwrap(JSON.parse(fenceMatch[1].trim())); } catch (_) { /* continue */ }
         }
 
-        // 3. Try finding first [ ... ] or { ... } block
+        // 3. Try finding [ ... ] array block
         const bracketMatch = text.match(/(\[\s*\{[\s\S]*\}\s*\])/);
         if (bracketMatch) {
             try { return JSON.parse(bracketMatch[1]); } catch (_) { /* continue */ }
         }
+
+        // 4. Try finding { ... } object block (greedy, for wrapper objects)
         const objectMatch = text.match(/(\{[\s\S]*\})/);
         if (objectMatch) {
-            try {
-                const parsed = JSON.parse(objectMatch[1]);
-                return Array.isArray(parsed) ? parsed : [parsed];
-            } catch (_) { /* continue */ }
+            try { return unwrap(JSON.parse(objectMatch[1])); } catch (_) { /* continue */ }
         }
 
         throw new Error(`Failed to extract JSON from AI response. Raw text: ${text.substring(0, 300)}`);
@@ -641,7 +740,7 @@
                 console.warn(`[AI Auto-Filler] Skipping step ${i}: invalid id "${step.id}"`);
                 continue;
             }
-            if (step.action !== 'fill' && step.action !== 'click') {
+            if (step.action !== 'fill' && step.action !== 'click' && step.action !== 'skip') {
                 console.warn(`[AI Auto-Filler] Skipping step ${i}: invalid action "${step.action}"`);
                 continue;
             }
@@ -691,7 +790,7 @@
     // [AI AGENT LOGIC]
     // =========================================================================
 
-    async function runAgent() {
+    async function runAgent(round = 1) {
         const providerName = getProviderName();
         updateStatus("Scanning Page...", "yellow");
 
@@ -705,65 +804,45 @@
         }
 
         // 2. Construct System + User Prompts (separated for proper role handling)
-        const systemPrompt = `You are a form auto-filling agent. You analyze simplified HTML structure and output a JSON action plan to fill in a questionnaire/form.
+        const systemPrompt = `You are a questionnaire auto-fill agent. Analyze the simplified HTML and output a JSON action plan.
 
-## Action Types
-- "fill": Set the value of <input>, <textarea>, or <select> elements.
-- "click": Click on radio buttons, checkboxes, clickable option elements, or buttons.
+## Actions
+- "fill": Set value of <input>/<textarea>/<select>. Requires "value" field.
+- "click": Click radio/checkbox/option elements.
+- "skip": Explicitly skip a question you cannot confidently answer. Optional "reason" field.
 
 ## Rules
-1. Match labels/questions to their associated inputs by DOM hierarchy (indentation = parent-child) and \`for\`/\`name\` attributes.
-2. Use the User Profile to answer personal information questions (name, phone, email, address, etc.).
-3. For opinion/attitude questions (Likert scales, satisfaction ratings, agreement scales):
-   - Select a slightly positive option (e.g., "比较满意", "agree", 4 out of 5).
-   - Never select extreme endpoints unless the profile explicitly indicates it.
-4. For knowledge/preference questions not covered by the profile, choose the most common or neutral answer.
-5. For terms/agreements/consent questions, always agree/accept.
-6. For matrix/grid questions, fill each row as a separate action.
-7. For <select> dropdowns: use "fill" with the option text or value.
-8. For radio/checkbox groups: use "click" on the element whose text matches your chosen option.
-9. Skip elements marked [disabled]. Respect elements marked [required] — always fill them.
-10. Do NOT click submit/next-page buttons — they will be handled separately.
-11. If an element already has a [current=...] value that looks correct, you may skip it.
+1. Match questions to inputs by DOM hierarchy and \`for\`/\`name\` attributes. Lines marked "--- Q ---" are heuristic question-boundary hints.
+2. Use the User Profile for personal info (name, phone, email, etc.).
+3. For opinion/attitude scales: pick a moderately positive option (e.g. 4/5, "比较满意"). Avoid extremes.
+4. For unknown preference questions: choose the most common or neutral answer.
+5. For agreements/consent: always accept.
+6. For matrix/grid questions: fill each sub-item as a separate action.
+7. For <select>: use "fill" with the option text. For radio/checkbox: use "click" on the matching element.
+8. Skip [disabled] elements. Always fill [required] elements.
+9. Do NOT click submit/next-page buttons — handled separately.
+10. Elements with [CHECKED] or [current=...] are already answered — skip unless incorrect.
 
-## Output Format
-Respond with ONLY a JSON array. No explanation, no markdown fences. Each object:
-{"id": "<_ai_id>", "action": "fill"|"click", "value": "<string, only for fill>"}
+## Output
+JSON array only. No markdown, no explanation.
+{"id": "<_ai_id>", "action": "fill"|"click"|"skip", "value": "<for fill only>", "reason": "<for skip only>"}
 
-## Examples
-Input with name field:
-  <input _ai_id="el_0" type="text" name="username" placeholder="请输入姓名" required>
-→ {"id": "el_0", "action": "fill", "value": "John Doe"}
-
-Radio group for gender:
+Example:
   <label> 性别
     <div _ai_id="el_5" role="radio"> 男
     <div _ai_id="el_6" role="radio"> 女
-→ {"id": "el_5", "action": "click"}
+→ [{"id":"el_5","action":"click"}]`;
 
-Select dropdown:
-  <select _ai_id="el_10" name="education" required>
-    <option _ai_id="el_11"> 高中
-    <option _ai_id="el_12"> 本科 [SELECTED]
-    <option _ai_id="el_13"> 硕士
-→ (already correct, skip or): {"id": "el_10", "action": "fill", "value": "本科"}
-
-Likert scale (1-5 satisfaction):
-  <label> 您对服务的满意度
-    <div _ai_id="el_20"> 非常不满意
-    <div _ai_id="el_21"> 不满意
-    <div _ai_id="el_22"> 一般
-    <div _ai_id="el_23"> 满意
-    <div _ai_id="el_24"> 非常满意
-→ {"id": "el_23", "action": "click"}`;
-
+        const roundInfo = round > 1
+            ? `\nNote: This is round ${round}. Elements with [CHECKED] or [current=...] were filled in previous rounds — only handle new or unfilled elements.\n`
+            : '';
         const userPrompt = `User Profile:
 ${CONFIG.userProfile}
-
-Simplified HTML Structure:
+${roundInfo}
+Form HTML:
 ${simplifiedHTML}
 
-Based on the user profile and the form structure above, output your JSON action plan.`;
+Output your JSON action plan.`;
 
         updateStatus(`${providerName} Thinking...`, "#00ffff");
 
@@ -812,7 +891,8 @@ Based on the user profile and the form structure above, output your JSON action 
                 const plan = validatePlan(extractJSON(planText));
 
                 console.log(`${providerName} Plan:`, plan);
-                return await executePlan(plan); // Return result for multi-round
+                const result = await executePlan(plan);
+                return { ...result, domSnapshot: simplifiedHTML }; // Include DOM for multi-round comparison
 
             } catch (e) {
                 lastError = e;
@@ -826,7 +906,7 @@ Based on the user profile and the form structure above, output your JSON action 
 
         // All attempts failed
         updateStatus(`Error: ${lastError.message}`, "red");
-        return { filled: 0, clicked: 0, skipped: 0, submitBtn: null };
+        return { filled: 0, clicked: 0, skipped: 0, submitBtn: null, domSnapshot: '' };
     }
 
     async function executePlan(plan) {
@@ -834,7 +914,7 @@ Based on the user profile and the form structure above, output your JSON action 
 
         let submitBtn = null;
         let nextPageBtn = null;
-        let filled = 0, clicked = 0, skipped = 0, fillFailed = 0;
+        let filled = 0, clicked = 0, skipped = 0, fillFailed = 0, clickFailed = 0, aiSkipped = 0;
         const submitKeywords = ['提交', 'submit', '下一步', '完成', '结束', 'next', '下一页'];
 
         for (const step of plan) {
@@ -868,16 +948,28 @@ Based on the user profile and the form structure above, output your JSON action 
                 filled++;
             } else if (step.action === 'click') {
                 simulateClick(el);
+                // Verify click for checkable elements
+                const checkable = el.type === 'radio' || el.type === 'checkbox' ||
+                    el.getAttribute('role') === 'radio' || el.getAttribute('role') === 'checkbox';
+                if (checkable && !el.checked && el.getAttribute('aria-checked') !== 'true') {
+                    clickFailed++;
+                    if (CONFIG.debug) console.warn(`[AI Auto-Filler] Click verify failed for ${step.id}`);
+                }
                 clicked++;
+            } else if (step.action === 'skip') {
+                aiSkipped++;
+                if (CONFIG.debug) console.log(`[AI Auto-Filler] AI skipped ${step.id}: ${step.reason || ''}`);
             }
 
             await new Promise(r => setTimeout(r, 50));
         }
 
         const statsMsg = `Done: ${filled} filled, ${clicked} clicked, ${skipped} skipped` +
-            (fillFailed > 0 ? `, ${fillFailed} fill-verify-failed` : '');
+            (aiSkipped > 0 ? `, ${aiSkipped} AI-skipped` : '') +
+            (fillFailed > 0 ? `, ${fillFailed} fill-verify-failed` : '') +
+            (clickFailed > 0 ? `, ${clickFailed} click-verify-failed` : '');
         console.log(`[AI Auto-Filler] ${statsMsg}`);
-        updateStatus(statsMsg, skipped > 0 || fillFailed > 0 ? 'orange' : '#00ff00');
+        updateStatus(statsMsg, skipped > 0 || fillFailed > 0 || clickFailed > 0 ? 'orange' : '#00ff00');
 
         return { filled, clicked, skipped, submitBtn, nextPageBtn };
     }
@@ -934,7 +1026,7 @@ Based on the user profile and the form structure above, output your JSON action 
                 updateStatus(`Round ${round}/${maxRounds}: Scanning...`, "yellow");
             }
 
-            const result = await runAgent();
+            const result = await runAgent(round);
 
             if (result.submitBtn) lastSubmitBtn = result.submitBtn;
 
@@ -951,12 +1043,12 @@ Based on the user profile and the form structure above, output your JSON action 
             // (conditional logic may have revealed new questions)
             if (result.filled > 0 || result.clicked > 0) {
                 const domChanged = await waitForDOMStable(500, 2000);
-                // Quick re-scan: check if new interactive elements appeared
+                // Quick re-scan: check if DOM has actually changed
                 const newFormRoot = findFormRoot();
                 const newDOM = generateSimplifiedDOM(newFormRoot);
-                const hasNewInteractive = elementMap.size > 0;
-                // If DOM has changed significantly (new elements appeared), do another round
-                if (domChanged && round < maxRounds && hasNewInteractive) {
+                const hasNewContent = newDOM !== result.domSnapshot;
+                // If DOM has changed (new elements appeared), do another round
+                if (hasNewContent && round < maxRounds) {
                     // Check if there are unfilled required fields
                     const requiredFields = newFormRoot.querySelectorAll(
                         'input[required]:not([disabled]), textarea[required]:not([disabled]), select[required]:not([disabled]), [aria-required="true"]:not([disabled])');

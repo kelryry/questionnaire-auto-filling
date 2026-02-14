@@ -34,12 +34,16 @@
 
 - 🧠 **真·AI 语义理解**：支持 **OpenAI 兼容 API**（OpenAI、DeepSeek、Moonshot 等）、**Google Gemini** 和 **Anthropic Claude**。AI 理解题目语义，根据你的设定生成合乎逻辑的答案，彻底告别随机乱填。
 - 🌐 **全平台通用 (Universal)**：不再局限于特定网站。只要是 HTML 网页，它都能提取 DOM 结构进行分析。
+- 📝 **启发式题目分组**：自动识别题号前缀、radio 分组、ARIA 语义标记，在发送给 AI 的内容中插入题目分组标记，帮助 AI 更准确地理解题目边界。
 - 🎭 **自定义用户画像 (Persona)**：在配置中写入你的身份（如：大学生、程序员、全职妈妈），AI 会全程扮演该角色。
   - *例：题目问"你的收入"，AI 会根据你设定的职业自动估算一个合理的区间。*
 - ⚛️ **框架穿透技术**：专为 React / Vue / Angular 等现代前端框架优化。通过模拟原生 Prototype 事件，解决"填了但没存进去"的顽疾。
 - ⏰ **定时狙击模式**：支持毫秒级定时启动。设置好时间，脚本会自动倒计时，适合抢讲座名额、抢活动报名等场景。
 - 🔄 **自动重试**：API 调用失败后自动重试，可配置重试次数和间隔。
 - 💭 **思考链控制**：Gemini 和 Anthropic 支持配置思考链长度，OpenAI 兼容 API 支持自定义参数。
+- ✅ **执行验证**：填写后自动验证 input 值是否生效，点击后检查 radio/checkbox 是否成功选中，并在控制台报告异常。
+- ⚠️ **Token 截断检测**：自动检测 AI 响应是否被截断（超出 token 上限），调试模式下显示 token 用量统计。
+- 📄 **多轮分页填写**：支持多页问卷自动翻页，填写后通过 DOM 快照对比检测新出现的题目。
 - 🌍 **代理兼容 (Proxy-Friendly)**：采用双策略网络请求——优先使用浏览器原生 `fetch()`（自动走浏览器/扩展代理），若因 CORS 失败则自动回退到 `GM_xmlhttpRequest`。无需额外配置，对需要代理访问 API 的用户（如中国大陆）开箱即用。
 
 ## 🚀 Quick Start (快速演示)
@@ -135,11 +139,17 @@ const CONFIG = {
         其他: 同意所有服务条款，遇到简答题请多写一点字数
     `,
 
+    // 多轮填写（适用于多页问卷或有条件逻辑的问卷）
+    maxRounds: 2,
+
     // 是否自动提交 (建议先设为 false，人工检查后再提交)
     autoSubmit: false,
 
     // 定时执行
     targetTime: "2025-12-03 15:00:00",
+
+    // 调试模式（开启后在控制台显示发送给 AI 的内容、token 用量等）
+    debug: false
 };
 ```
 
@@ -180,12 +190,13 @@ customParams: { "temperature": 0.5 }
 为了让您用得放心，这里简单介绍一下本脚本的黑科技流程：
 
 1. **DOM 萃取**：脚本运行后，会遍历当前页面的 HTML 树，提取出所有"可交互元素"（输入框、按钮、选项）及其对应的"标签文字"。
-2. **结构轻量化**：为了节省 Token 和提高速度，脚本会将复杂的 HTML 压缩成 AI 能看懂的简化描述语言。
-3. **大模型推理**：将"页面结构" + "你的用户画像"打包发送给所选 AI 提供商（OpenAI 兼容 / Gemini / Anthropic）。
-4. **双策略网络请求**：优先使用浏览器原生 `fetch()`（遵循浏览器/代理扩展的代理设置），若因 CORS 跨域限制失败，则自动回退到 Tampermonkey 的 `GM_xmlhttpRequest`（绕过跨域限制）。这确保了无论是否使用代理都能正常工作。
-5. **生成行动计划**：AI 返回一个 JSON 格式的操作列表（例如：`[{"id": "input_1", "action": "fill", "value": "张三"}, ...]`）。
-6. **仿真执行**：脚本接管浏览器，模拟人类的 `focus` -> `input` -> `blur` 事件流，确保数据被前端框架正确捕获。
-7. **自动重试**：如果 API 调用失败（网络错误、限流等），脚本会根据配置自动重试。
+2. **结构轻量化 + 启发式题目分组**：为了节省 Token，脚本将复杂 HTML 压缩成简化描述，并用启发式算法（题号前缀、radio name 分组、ARIA 语义标记）插入题目分组标记 `--- Q ---`，帮助 AI 识别题目边界。
+3. **大模型推理**：将"页面结构" + "你的用户画像"打包发送给所选 AI 提供商。AI 可以选择 `fill`（填写）、`click`（点击）或 `skip`（跳过无法确定的题目）。
+4. **双策略网络请求**：优先使用 `fetch()`（遵循代理设置），若 CORS 失败则回退到 `GM_xmlhttpRequest`。
+5. **生成行动计划**：AI 返回 JSON 操作列表，脚本自动检测 token 截断、解析包裹对象（如 `{"actions": [...]}`），并验证每个步骤的有效性。
+6. **仿真执行**：模拟人类事件流（`focus` → `input` → `blur`），确保数据被前端框架正确捕获。填写后验证 value 是否生效，点击后检查 radio/checkbox 是否选中。
+7. **多轮分页**：填写完成后，通过 DOM 快照对比检测是否有新题目出现（条件逻辑触发或翻页），自动进入下一轮填写。
+8. **自动重试**：API 调用失败后根据配置自动重试。
 
 ---
 
@@ -258,12 +269,16 @@ That project is also **based on AI Large Models**, but it has been **deeply tune
 
 - 🧠 **True AI Semantic Understanding**: Supports **OpenAI-compatible APIs** (OpenAI, DeepSeek, Moonshot, etc.), **Google Gemini**, and **Anthropic Claude**. The AI understands question semantics and generates logical answers based on your settings — no more random inputs.
 - 🌐 **Universal Compatibility**: No longer limited to specific websites. As long as it is an HTML webpage, it can extract the DOM structure for analysis.
+- 📝 **Heuristic Question Grouping**: Automatically detects question number prefixes, radio name groups, and ARIA semantic markers, inserting question-boundary hints (`--- Q ---`) to help the AI better identify question scope.
 - 🎭 **Custom User Persona**: Define your identity in the configuration (e.g., college student, programmer, full-time mom), and the AI will role-play throughout the process.
   - *Example: If the question asks for "Income," the AI will automatically estimate a reasonable range based on your set profession.*
 - ⚛️ **Framework Penetration Technology**: Optimized for modern frontend frameworks like React / Vue / Angular. It solves the issue of "filled but not saved" by simulating native Prototype events.
 - ⏰ **Timer/Sniper Mode**: Supports millisecond-level scheduled starts. Set the time, and the script will count down automatically—perfect for grabbing spots in lectures or event registrations.
 - 🔄 **Auto Retry**: Automatically retries on API failure with configurable retry count and delay.
 - 💭 **Thinking Chain Control**: Configure thinking/reasoning depth for Gemini and Anthropic; use custom parameters for OpenAI-compatible APIs.
+- ✅ **Execution Verification**: Automatically verifies that input values took effect after filling, checks radio/checkbox checked state after clicking, and reports anomalies in the console.
+- ⚠️ **Token Truncation Detection**: Automatically detects if AI response was truncated (exceeded token limit); shows token usage statistics in debug mode.
+- 📄 **Multi-Round Pagination**: Supports auto-navigation for multi-page questionnaires, detecting newly appeared questions via DOM snapshot comparison.
 - 🌍 **Proxy-Friendly**: Dual-strategy networking—first tries native `fetch()` (follows browser/extension proxy settings), then falls back to `GM_xmlhttpRequest` (bypasses CORS) if needed. Works out-of-the-box for users who need proxies to access APIs (e.g., users in mainland China).
 
 ## 🚀 Quick Start
@@ -350,6 +365,9 @@ const CONFIG = {
     retryCount: 1,       // retries after failure (0 = no retry)
     retryDelayMs: 1000,  // delay between retries in ms
 
+    // Multi-round filling (for multi-page forms or conditional logic)
+    maxRounds: 2,
+
     // [CORE] User Profile: Tell AI who you are
     userProfile: `
         Name: John Doe
@@ -361,6 +379,9 @@ const CONFIG = {
 
     autoSubmit: false,
     targetTime: "2025-12-03 15:00:00",
+
+    // Debug mode (shows DOM payload, token usage, etc. in console)
+    debug: false
 };
 ```
 
@@ -401,12 +422,13 @@ In the comment area at the top of the script, find `// @match` and add the URL o
 To ensure you can use this with confidence, here is a brief introduction to the underlying technology:
 
 1. **DOM Extraction**: After the script runs, it traverses the HTML tree of the current page and extracts all "interactive elements" (inputs, buttons, options) and their corresponding "label text."
-2. **Structure Simplification**: To save Tokens and improve speed, the script compresses complex HTML into a simplified description language that the AI can understand.
-3. **LLM Inference**: Packages the "Page Structure" + "Your User Profile" and sends it to your chosen AI provider (OpenAI-compatible / Gemini / Anthropic).
-4. **Dual-Strategy Networking**: First tries browser-native `fetch()` (respects browser/extension proxy settings). If blocked by CORS, automatically falls back to Tampermonkey's `GM_xmlhttpRequest` (bypasses CORS restrictions). This ensures the script works regardless of proxy configuration.
-5. **Action Plan Generation**: The AI returns an operation list in JSON format (e.g., `[{"id": "input_1", "action": "fill", "value": "John Doe"}, ...]`).
-6. **Simulation Execution**: The script takes over the browser, simulating the human event flow of `focus` -> `input` -> `blur` to ensure data is correctly captured by frontend frameworks.
-7. **Auto Retry**: If the API call fails (network error, rate limiting, etc.), the script automatically retries according to your configuration.
+2. **Structure Simplification + Heuristic Question Grouping**: To save tokens, the script compresses complex HTML into a simplified description. It then uses heuristic algorithms (question number prefixes, radio name groups, ARIA semantic markers) to insert `--- Q ---` question-boundary markers, helping the AI identify question scope.
+3. **LLM Inference**: Packages the "Page Structure" + "Your User Profile" and sends it to your chosen AI provider. The AI can choose to `fill`, `click`, or `skip` (for uncertain questions).
+4. **Dual-Strategy Networking**: First tries browser-native `fetch()` (respects proxy settings). If blocked by CORS, automatically falls back to `GM_xmlhttpRequest`.
+5. **Action Plan Generation**: The AI returns a JSON operation list. The script automatically detects token truncation, unwraps wrapper objects (e.g., `{"actions": [...]}`), and validates each step.
+6. **Simulation Execution**: Simulates the human event flow (`focus` → `input` → `blur`) to ensure data is correctly captured by frontend frameworks. Verifies that input values took effect and checks radio/checkbox checked state after clicking.
+7. **Multi-Round Pagination**: After filling, compares DOM snapshots to detect newly appeared questions (from conditional logic or page navigation) and proceeds to the next round automatically.
+8. **Auto Retry**: If the API call fails, the script automatically retries according to your configuration.
 
 ---
 
